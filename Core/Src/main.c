@@ -63,6 +63,7 @@ uint16_t z_current_position = 0;
 uint16_t z_target_position = 0;
 uint16_t x_target_position = 0;
 int16_t z_diff_position = 0;
+float target_position = 0;
 typedef struct
 {
 	// for record New / Old value to calculate dx / dt
@@ -77,14 +78,36 @@ enum
 {
 	NEW,OLD
 };
-float velocity;
-float position;
+float velocity = 0;
+float position = 0;
 float angular_position;
+float angular_velocity;
 int position_round = 0;
 int counter = 0;
 int n = 0;
 int mode = 0;
-float linear_position = 0;
+
+//trajectory
+float trajec_position;
+float trajec_velocity;
+float trajec_acceleration;
+float trajec_target;
+uint8_t trajec_state;
+float p0;
+
+//position PID
+float position_Kp = 0;
+float position_Ki = 0;
+float position_Kd = 0;
+float position_Ts = 0.005;
+float position_PID_output = 0;
+
+//velocity PID
+float velocity_Kp = 0.008;
+float velocity_Ki = 0.005;
+float velocity_Kd = 0.00001;
+float velocity_Ts = 0.001;
+float velocity_PID_output = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -102,6 +125,14 @@ void UARTDMAConfig();
 void update_position();
 uint64_t micros();
 void QEIEncoderPosVel_Update();
+
+void setMotor();
+//trajectory
+void trajectory();
+
+//PID
+void velocity_PID();
+void position_PID();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -166,37 +197,51 @@ int main(void)
 
 	  if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13)){
 		  mode = 1;
+		  target_position = 600;
 	  }
-	  if(mode == 1){
-		  if(sensor1 == 0 && n == 0){
-			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
-			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
-		  }
-		  else if(sensor1 == 1){
-			  n = 1;
-		  }
-		  else if(sensor2 == 0 && n == 1){
-			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
-			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
-		  }
-		  else if(sensor2 == 1){
-			  mode = 0;
-			  n = 0;
-			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
-			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-		  }
+	  else{
+		  target_position = 0;
 	  }
+//	  if(mode == 1){
+//		  if(sensor1 == 0 && n == 0){
+//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
+//		  }
+//		  else if(sensor1 == 1){
+//			  n = 1;
+//		  }
+//		  else if(sensor2 == 0 && n == 1){
+//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
+//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
+//		  }
+//		  else if(sensor2 == 1){
+//			  mode = 0;
+//			  n = 0;
+//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+//		  }
+//	  }
 
-//	  //Call every 0.1 s
-	  static uint64_t timestamp =0;
-	  int64_t currentTime = micros();
-	  if(currentTime > timestamp)
+	  trajectory();
+
+	  static uint64_t timestamp_velocity_PID = 0;
+	  uint64_t currentTime = micros();
+	  if(currentTime > timestamp_velocity_PID)
 	  {
-		  timestamp =currentTime + 100000;//us
+		  timestamp_velocity_PID = currentTime + 1000;//us
 		  QEIEncoderPosVel_Update();
+		  velocity = angular_velocity*14/2.0/M_PI;
+		  velocity_PID();
+		  setMotor();
 	  }
-	  linear_position = velocity*14/2.0/M_PI;
 
+	  static uint64_t timestamp_position_PID = 0;
+	  currentTime = micros();
+	  if(currentTime > timestamp_position_PID)
+	  {
+		  timestamp_position_PID = currentTime + 5000;//us
+		  position_PID();
+	  }
   }
   /* USER CODE END 3 */
 }
@@ -666,14 +711,133 @@ void QEIEncoderPosVel_Update()
 	//calculate anglar velocity
 	QEIdata.QEIAngularVelocity = diffPosition / diffTime;
 
-	velocity = QEIdata.QEIAngularVelocity/2048.0*2*M_PI;
+	angular_velocity = QEIdata.QEIAngularVelocity/2048.0*2*M_PI;
 	angular_position = (QEIdata.Position[NEW]%2048)/2048.0*2*M_PI;
 	position_round = (counter*31)+(int)(QEIdata.Position[NEW]/2048.0);
 	position = ((angular_position)/(2.0*M_PI)*14)+(14*position_round);
 	//store value for next loop
 	QEIdata.Position[OLD] = QEIdata.Position[NEW];
 	QEIdata.TimeStamp[OLD]=QEIdata.TimeStamp[NEW];
+}
 
+void trajectory(){
+	static uint32_t Timestamp;
+	if(trajec_target != 0 && trajec_state == 0){
+		trajec_state = 1;
+		Timestamp = HAL_GetTick();
+	}
+	else if(trajec_state == 1 && trajec_target >= 0){
+		float t = (HAL_GetTick() - Timestamp)*0.001;
+		float time = (-100 + sqrt(10000 + (2000*trajec_target)))/1000;
+		if(HAL_GetTick() - Timestamp <= (time*1000)){
+			trajec_acceleration = 500.0;
+			trajec_velocity = 500*t;
+			trajec_position = (250*t*t)+p0;
+		}
+		else if(HAL_GetTick() - Timestamp <= ((time+0.2)*1000)){
+			trajec_acceleration = 0;
+			trajec_velocity = 500*time;
+			trajec_position = ((500*time*(t-time))+(250*time*time))+p0;
+		}
+		else if(HAL_GetTick() - Timestamp <= (((time*2)+0.2)*1000)){
+			trajec_acceleration = -500.0;
+			trajec_velocity = (-500*(t-time-0.2))+(500*time);
+			trajec_position = ((-250*(t-time-0.2)*(t-time-0.2))+(500*time*(t-time-0.2))+(250*time*time)+(100*time))+p0;
+		}
+		else{
+			trajec_acceleration = 0;
+//			trajec_velocity = 0;
+//			trajec_position = 0;
+			trajec_target = 0;
+			trajec_state = 0;
+		}
+	}
+	else if(trajec_state == 1 && trajec_target < 0){
+		float t = (HAL_GetTick() - Timestamp)*0.001;
+		float time = (-100 + sqrt(10000 + (-2000*trajec_target)))/1000;
+		if(HAL_GetTick() - Timestamp <= (time*1000)){
+			trajec_acceleration = -500.0;
+			trajec_velocity = (500*t)*-1;
+			trajec_position = ((250*t*t)*-1)+p0;
+		}
+		else if(HAL_GetTick() - Timestamp <= ((time+0.2)*1000)){
+			trajec_acceleration = 0;
+			trajec_velocity = (500*time)*-1;
+			trajec_position = (((500*time*(t-time))+(250*time*time))*-1)+p0;
+		}
+		else if(HAL_GetTick() - Timestamp <= (((time*2)+0.2)*1000)){
+			trajec_acceleration = 500.0;
+			trajec_velocity = ((-500*(t-time-0.2))+(500*time))*-1;
+			trajec_position = (((-250*(t-time-0.2)*(t-time-0.2))+(500*time*(t-time-0.2))+(250*time*time)+(100*time))*-1)+p0;
+		}
+		else{
+			trajec_acceleration = 0;
+//			trajec_velocity = 0;
+//			trajec_position = 0;
+			trajec_target = 0;
+			trajec_state = 0;
+		}
+	}
+	else if(trajec_state == 0 && trajec_target == 0){
+		trajec_target = target_position-trajec_position;
+		p0 = trajec_position;
+	}
+}
+
+void velocity_PID(){
+	static float u_n;
+	static float u_n1 = 0;
+	static float u_n2 = 0;
+	static float y_n;
+	static float y_n1 = 0;
+	float one = (2*velocity_Ts*velocity_Kp)+(velocity_Ki*velocity_Ts*velocity_Ts)+(2*velocity_Kd);
+	float two = (-2*velocity_Ts*velocity_Kp)+(velocity_Ki*velocity_Ts*velocity_Ts)-(4*velocity_Kd);
+	float three = 2*velocity_Kd;
+	float four = 2*velocity_Ts;
+	u_n = trajec_velocity + position_PID_output - velocity;
+	y_n = ((one*u_n)+(two*u_n1)+(three*u_n2)+(four*y_n1))/four;
+
+	velocity_PID_output += y_n;
+	u_n2 = u_n1;
+	u_n1 = u_n;
+	y_n1 = y_n;
+}
+
+void position_PID(){
+	static float u_n;
+	static float u_n1 = 0;
+	static float u_n2 = 0;
+	static float y_n;
+	static float y_n1 = 0;
+	float one = (2*position_Ts*position_Kp)+(position_Ki*position_Ts*position_Ts)+(2*position_Kd);
+	float two = (-2*position_Ts*position_Kp)+(position_Ki*position_Ts*position_Ts)-(4*position_Kd);
+	float three = 2*position_Kd;
+	float four = 2*position_Ts;
+	u_n = trajec_position - position;
+	y_n = ((one*u_n)+(two*u_n1)+(three*u_n2)+(four*y_n1))/four;
+
+	position_PID_output += y_n;
+	u_n2 = u_n1;
+	u_n1 = u_n;
+	y_n1 = y_n;
+}
+
+void setMotor()
+{
+	if(velocity_PID_output > 24){
+		velocity_PID_output = 24;
+	}
+	else if(velocity_PID_output < -24){
+		velocity_PID_output = -24;
+	}
+	if(velocity_PID_output > 0){
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_RESET);
+		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)velocity_PID_output*999/24.0);
+	}
+	else{
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_SET);
+		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)velocity_PID_output*(-999)/24.0);
+	}
 }
 /* USER CODE END 4 */
 
