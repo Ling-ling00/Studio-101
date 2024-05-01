@@ -130,10 +130,6 @@ int main(void)
 	  Modbus_Protocal_Worker();
 
 	  registerFrame[0x00].U16=22881;
-
-	  vaccum=registerFrame[2].U16;
-	  gripper=registerFrame[2].U16;
-
 	  set_shelves();
 	  set_goalpoint();
 	  run_pointmode();
@@ -388,7 +384,7 @@ void set_shelves(){
 		registerFrame[0x10].U16=0b0001; //z-axis Moving Status
 		registerFrame[0x01].U16=0b0000;
 	}
-//	if() บันทึกค่า shelves ทั้ง5ชั้นสำเร็จ
+//	if() บันทึ�?ค่า shelves ทั้ง5ชั้นสำเร็จ
 //	registerFrame[0x10].U16=0b0000;
 }
 void set_goalpoint(){
@@ -398,12 +394,13 @@ void run_pointmode(){
 	if(registerFrame[0x01].U16==0b1000){
 		registerFrame[0x01].U16=0b0000;
 		registerFrame[0x10].U16=0b00010000; //Go point
-//	if()หุ่นเคลื่อนที่ไปยังแกน Z เสร็จสิ้น
+//	if()หุ่นเคลื่อนที่ไปยัง�?�?น Z เสร็จสิ้น
 //		registerFrame[0x10].U16=0b0000; //เสร็จ jogging
 	}
 }
 void set_home(){
 	if(registerFrame[0x01].U16==0b0010){
+
 		registerFrame[0x01].U16=0b0000;
 		registerFrame[0x10].U16=0b0010;
 	}

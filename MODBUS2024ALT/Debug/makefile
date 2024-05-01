@@ -60,8 +60,8 @@ all: main-build
 main-build: MODBUS2024ALT.elf secondary-outputs
 
 # Tool invocations
-MODBUS2024ALT.elf MODBUS2024ALT.map: $(OBJS) $(USER_OBJS) C:\FIBO\2566_2\FRA222\MODBUS2024ALT\STM32G474RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "MODBUS2024ALT.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\FIBO\2566_2\FRA222\MODBUS2024ALT\STM32G474RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="MODBUS2024ALT.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+MODBUS2024ALT.elf MODBUS2024ALT.map: $(OBJS) $(USER_OBJS) C:\Users\Ponwalai\Documents\GitHub\New\ folder\Studio-101\MODBUS2024ALT\STM32G474RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "MODBUS2024ALT.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Ponwalai\Documents\GitHub\New folder\Studio-101\MODBUS2024ALT\STM32G474RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="MODBUS2024ALT.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
