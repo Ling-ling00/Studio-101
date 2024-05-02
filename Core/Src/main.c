@@ -24,6 +24,8 @@
 #include "stdio.h"
 #include "string.h"
 #include "math.h"
+#include "arm_math.h"
+#include "ModBusRTU.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -42,28 +44,59 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-UART_HandleTypeDef hlpuart1;
-UART_HandleTypeDef huart1;
-DMA_HandleTypeDef hdma_usart1_rx;
-
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
+TIM_HandleTypeDef htim16;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart1_rx;
+DMA_HandleTypeDef hdma_usart2_tx;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
-uint16_t x_floor[5] = {0, 0, 0, 0, 0};
-uint16_t z_floor[5] = {0, 0, 0, 0, 0};
+int debug =0;
+
+//modbus
+ModbusHandleTypedef hmodbus;
+u16u8_t registerFrame[200];
+
+int count=0;
+int vaccum;
+int gripper;
+
+int home =0;
+int point_mode = 0;
+int setshelves_mode = 0;
+int jog_mode = 0;
+int place_order;
+int pick_order;
+
+//Joy
+int x_floor[5] = {-1, -1, -1, -1, -1};
+int z_floor[5] = {-1, -1, -1, -1, -1};
 uint8_t RxBuffer[10];
-uint8_t sensor1 = 0;
-uint8_t sensor2 = 0;
-uint8_t motor1_INA = 0;
-uint8_t motor1_INB = 0;
-uint16_t motor1_PWM = 50;
-uint16_t z_current_position = 0;
+
+//sensor
+uint8_t sensor_up = 0;
+uint8_t sensor_down = 0;
+
+//Joy control
 uint16_t z_target_position = 0;
 uint16_t x_target_position = 0;
-int16_t z_diff_position = 0;
-float target_position = 0;
+
+//for PID joy
+arm_pid_instance_f32 PID = {0};
+float setposition = 0; //target of PID
+float Vfeedback = 0;
+float Error;
+
+//base system
+int gotofloor;
+
+//QEI
 typedef struct
 {
 	// for record New / Old value to calculate dx / dt
@@ -71,7 +104,8 @@ typedef struct
 	uint64_t TimeStamp[2];
 	float QEIPostion_1turn;
 	float QEIAngularVelocity;
-}QEI_StructureTypeDef;
+}
+QEI_StructureTypeDef;
 QEI_StructureTypeDef QEIdata = {0};
 uint64_t _micros = 0;
 enum
@@ -80,11 +114,13 @@ enum
 };
 float velocity = 0;
 float position = 0;
-float angular_position;
 float angular_velocity;
+float angular_position;
 int position_round = 0;
 int counter = 0;
-int n = 0;
+
+
+//mode
 int mode = 0;
 
 //trajectory
@@ -114,25 +150,48 @@ float velocity_PID_output = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
-static void MX_LPUART1_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_TIM16_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-void z_transition();
+//modbus
+void set_shelves();
+void set_goalpoint();
+void run_pointmode();
+void set_home();
+void pick_place();
+void run_jogmode();
+
+//Joy
 void UARTDMAConfig();
 void update_position();
+
+//Timer
 uint64_t micros();
+
+//QEI
 void QEIEncoderPosVel_Update();
 
+//Motor
 void setMotor();
+
 //trajectory
 void trajectory();
 
 //PID
 void velocity_PID();
 void position_PID();
+
+//gripper
+void push();
+void pull();
+
+//vacuum
+void vacuum();
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -169,18 +228,66 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_LPUART1_UART_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_TIM4_Init();
   MX_TIM5_Init();
+  MX_USART2_UART_Init();
+  MX_TIM16_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  //modbus
+  hmodbus.huart = &huart2;
+  hmodbus.htim = &htim16;
+  hmodbus.slaveAddress = 0x15;
+  hmodbus.RegisterSize =200;
+  Modbus_init(&hmodbus, registerFrame);
+
+  //Joy
   UARTDMAConfig();
+
+  //Motor
   HAL_TIM_Base_Start(&htim3);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_RESET);
+
+  //encoder
   HAL_TIM_Encoder_Start(&htim4,TIM_CHANNEL_ALL);
   HAL_TIM_Base_Start_IT(&htim5);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_RESET);
+
+  //PID
+//    PID.Kp = 0.34;
+//    PID.Ki = 0.0000006;
+//    PID.Kd = 0.0000001;
+    PID.Kp = 0.478;
+    PID.Ki = 0.0000006;
+    PID.Kd = 0.0000000151;
+    arm_pid_init_f32(&PID, 0);
+
+  //Home
+  while(1)
+  {
+	  sensor_up = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);
+	  sensor_down = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+	  registerFrame[0x00].U16=22881;
+	  if(sensor_down == 0){
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
+		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*1.5/10.0);
+	  }
+	  else if(sensor_down == 1){
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+		  __HAL_TIM_SET_COUNTER(&htim4, 0);
+		  QEIdata.Position[NEW] = 0;
+		  QEIEncoderPosVel_Update();
+		  angular_position = 0.0;
+		  position = 0.0;
+		  position_round = 0;
+		  z_target_position = 0;
+		  x_target_position = 0;
+		  break;
+	  }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -190,58 +297,163 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-//	  z_transition();
-//	  update_position();
-	  sensor1 = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);
-	  sensor2 = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+	  sensor_up = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);
+	  sensor_down = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
 
-	  if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13)){
-		  mode = 1;
-		  target_position = 600;
-	  }
-	  else{
-		  target_position = 0;
-	  }
-//	  if(mode == 1){
-//		  if(sensor1 == 0 && n == 0){
-//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
-//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
-//		  }
-//		  else if(sensor1 == 1){
-//			  n = 1;
-//		  }
-//		  else if(sensor2 == 0 && n == 1){
-//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
-//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*4/5.0);
-//		  }
-//		  else if(sensor2 == 1){
-//			  mode = 0;
-//			  n = 0;
-//			  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
-//			  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-//		  }
-//	  }
-
-	  trajectory();
-
-	  static uint64_t timestamp_velocity_PID = 0;
+	  static uint64_t timestamp_QEI = 0;
 	  uint64_t currentTime = micros();
-	  if(currentTime > timestamp_velocity_PID)
+	  if(currentTime > timestamp_QEI)
 	  {
-		  timestamp_velocity_PID = currentTime + 1000;//us
+		  timestamp_QEI = currentTime + 1000;//us
 		  QEIEncoderPosVel_Update();
 		  velocity = angular_velocity*14/2.0/M_PI;
-		  velocity_PID();
-		  setMotor();
 	  }
 
-	  static uint64_t timestamp_position_PID = 0;
-	  currentTime = micros();
-	  if(currentTime > timestamp_position_PID)
-	  {
-		  timestamp_position_PID = currentTime + 5000;//us
-		  position_PID();
-	  }
+	  Modbus_Protocal_Worker();
+	  registerFrame[0x00].U16=22881;
+
+	  set_shelves();
+	  set_goalpoint();
+	  run_pointmode();
+	  set_home();
+//	  pick_place();
+	  run_jogmode();
+
+//	  debug++;
+
+//
+//
+//	  /*-------------------------go to mode-------------------------------*/
+//
+//	  if(mode == 3){
+//		  if (gotofloor == 1){
+//			  setposition = z_floor[0];
+//		  }
+//		  else if (gotofloor == 2){
+//			  setposition = z_floor[1];
+//		  }
+//		  else if (gotofloor == 3){
+//			  setposition = z_floor[2];
+//		  }
+//		  else if (gotofloor == 4){
+//			  setposition = z_floor[3];
+//		  }
+//		  else if (gotofloor == 5){
+//			  setposition = z_floor[4];
+//		  }
+//
+//		  trajectory();
+//
+//
+//		  static uint64_t timestamp_velocity_PID = 0;
+//		  uint64_t currentTime = micros();
+//		  if(currentTime > timestamp_velocity_PID)
+//		  {
+//			  timestamp_velocity_PID = currentTime + 1000;//us
+//			  QEIEncoderPosVel_Update();
+//			  velocity = angular_velocity*14/2.0/M_PI;
+//			  if(fabsf(setposition-position) < 0.15){
+//				  Vfeedback = 0;
+//			  }
+//			  else{
+//				  velocity_PID();
+//				  Vfeedback = velocity_PID_output;
+//			  }
+//			  setMotor();
+//		  }
+//
+//		  static uint64_t timestamp_position_PID = 0;
+//		  currentTime = micros();
+//		  if(currentTime > timestamp_position_PID)
+//		  {
+//			  timestamp_position_PID = currentTime + 5000;//us
+//			  position_PID();
+//		  }
+//	  }
+//
+//	  /*-------------------------jog mode-------------------------------*/
+//
+//	  else if(mode == 2){
+//		  //Call every 0.1 s
+//		  static uint64_t timestamp =0;
+//		  int64_t currentTime = micros();
+//		  if(currentTime > timestamp)
+//		  {
+//			  timestamp =currentTime + 100000;//us
+//			  QEIEncoderPosVel_Update();
+//		  }
+//		  velocity = angular_velocity*14/2.0/M_PI;
+//		  update_position();
+//		  setposition = z_target_position;
+//		  Error = setposition - position;
+//		  Vfeedback = arm_pid_f32(&PID, Error);
+//		  if (fabsf(Error) <= 0.1){
+//			  Vfeedback = 0;
+//		  }
+//		  if(Vfeedback <= 4.3 && Vfeedback > 0){
+//			  Vfeedback = 4.3;
+//		  }
+//		  if(Vfeedback >= -1.75 && Vfeedback < 0){
+//			  Vfeedback = -1.78;
+//		  }
+//		  if(Vfeedback >= 24){
+//			  Vfeedback = 24;
+//		  }
+//		  setMotor();
+//	  }
+//	  else if(mode == 1){
+//		  //Call every 0.1 s
+//		  static uint64_t timestamp =0;
+//		  int64_t currentTime = micros();
+//		  if(currentTime > timestamp)
+//		  {
+//			  timestamp =currentTime + 100000;//us
+//			  QEIEncoderPosVel_Update();
+//		  }
+//		  velocity = angular_velocity*14/2.0/M_PI;
+//
+//		  update_position();
+//		  if (gotofloor == 1){
+//			setposition = z_floor[0];
+//		  }
+//		  else if (gotofloor == 2){
+//			setposition = z_floor[1];
+//		  }
+//		  else if (gotofloor == 3){
+//		  	setposition = z_floor[2];
+//		  }
+//		  else if (gotofloor == 4){
+//		  	setposition = z_floor[3];
+//		  }
+//		  else if (gotofloor == 5){
+//		  	setposition = z_floor[4];
+//		  }
+//
+//
+//		  Error = setposition - position;
+//		  Vfeedback = arm_pid_f32(&PID, Error);
+//		  if (fabsf(Error) <= 0.1){
+//		  	Vfeedback = 0;
+//		  }
+//		  setMotor();
+//	  }
+//
+//	  else if(mode == 0){
+//		  //Call every 0.1 s
+//		  		  static uint64_t timestamp =0;
+//		  		  int64_t currentTime = micros();
+//		  		  if(currentTime > timestamp)
+//		  		  {
+//		  			  timestamp =currentTime + 100000;//us
+//		  			  QEIEncoderPosVel_Update();
+//		  		  }
+//		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+//		  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+//		  update_position();
+//	  }
+
+
+
   }
   /* USER CODE END 3 */
 }
@@ -293,97 +505,47 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief LPUART1 Initialization Function
+  * @brief TIM2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_LPUART1_UART_Init(void)
+static void MX_TIM2_Init(void)
 {
 
-  /* USER CODE BEGIN LPUART1_Init 0 */
+  /* USER CODE BEGIN TIM2_Init 0 */
 
-  /* USER CODE END LPUART1_Init 0 */
+  /* USER CODE END TIM2_Init 0 */
 
-  /* USER CODE BEGIN LPUART1_Init 1 */
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
 
-  /* USER CODE END LPUART1_Init 1 */
-  hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 115200;
-  hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
-  hlpuart1.Init.StopBits = UART_STOPBITS_1;
-  hlpuart1.Init.Parity = UART_PARITY_NONE;
-  hlpuart1.Init.Mode = UART_MODE_TX_RX;
-  hlpuart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  hlpuart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  hlpuart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  hlpuart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&hlpuart1) != HAL_OK)
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 169;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 200000;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&hlpuart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&hlpuart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&hlpuart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN LPUART1_Init 2 */
+  /* USER CODE BEGIN TIM2_Init 2 */
 
-  /* USER CODE END LPUART1_Init 2 */
-
-}
-
-/**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 4800;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -516,7 +678,7 @@ static void MX_TIM5_Init(void)
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 169;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 4.294967295E9;
+  htim5.Init.Period = 4294967295;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
@@ -541,6 +703,138 @@ static void MX_TIM5_Init(void)
 }
 
 /**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 169;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 1145;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OnePulse_Init(&htim16, TIM_OPMODE_SINGLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 4800;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 19200;
+  huart2.Init.WordLength = UART_WORDLENGTH_9B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_EVEN;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -554,6 +848,12 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -615,34 +915,246 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void z_transition()
-{
-	if (z_diff_position > 0){
-		if (sensor1 == 0){
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
-			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)(motor1_PWM/100.0*999));
+void set_shelves(){
+	registerFrame[0x00].U16=22881;
+	if(registerFrame[0x01].U16==0b0001){
+		registerFrame[0x01].U16=0b0000;
+		registerFrame[0x10].U16=0b0001; //z-axis Moving Status
+		setshelves_mode = 1;
+	}
+	if(setshelves_mode == 1){
+		//Call every 0.1 s
+		registerFrame[0x00].U16=22881;
+		static uint64_t timestamp = 0;
+		int64_t currentTime = micros();
+		if(currentTime > timestamp)
+		{
+			timestamp =currentTime + 100000;//us
+			QEIEncoderPosVel_Update();
 		}
-		else if (sensor1 == 1){
-			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-			z_target_position = 680;
-			z_current_position = 680;
+		velocity = angular_velocity*14/2.0/M_PI;
+		update_position();
+		setposition = z_target_position;
+		Error = setposition - position;
+		Vfeedback = arm_pid_f32(&PID, Error);
+		if (fabsf(Error) <= 0.1){
+			Vfeedback = 0;
+		}
+		if(Vfeedback <= 4.3 && Vfeedback > 0){
+			Vfeedback = 4.3;
+		}
+		if(Vfeedback >= -1.75 && Vfeedback < 0){
+			Vfeedback = -1.78;
+		}
+		if(Vfeedback >= 24){
+			Vfeedback = 24;
+		}
+		setMotor();
+		if(z_floor[0] != -1 && z_floor[1] != -1 && z_floor[2] != -1 && z_floor[3] != -1 && z_floor[4] != -1){
+			registerFrame[0x23].U16 = z_floor[0];
+			registerFrame[0x24].U16 = z_floor[1];
+			registerFrame[0x25].U16 = z_floor[2];
+			registerFrame[0x26].U16 = z_floor[3];
+			registerFrame[0x27].U16 = z_floor[4];
+			setshelves_mode = 0;
+			registerFrame[0x10].U16=0b0000;
 		}
 	}
-	else if (z_diff_position < 0){
-		if (sensor2 == 0){
-			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
-			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)(motor1_PWM/100.0*999));
+}
+void set_goalpoint(){
+	//goal point z
+}
+void run_pointmode(){
+	if(registerFrame[0x01].U16==0b1000){
+		registerFrame[0x01].U16=0b0000;
+		registerFrame[0x10].U16=0b00010000; //Go point
+		setposition = (registerFrame[0x30].U16)/10.0;
+		point_mode = 1;
+	}
+	if(point_mode == 1){
+		trajectory();
+			static uint64_t timestamp_velocity_PID = 0;
+			uint64_t currentTime = micros();
+			if(currentTime > timestamp_velocity_PID)
+			{
+				if(fabsf(setposition-position) > 0.01){
+					timestamp_velocity_PID = currentTime + 1000;//us
+					velocity_PID();
+					Vfeedback = velocity_PID_output;
+					setMotor();
+				}
+				else{
+					velocity_PID_output = 0;
+					Vfeedback = 0;
+					setMotor();
+					registerFrame[0x10].U16=0b0000;
+					point_mode = 0;
+				}
+			}
+
+			static uint64_t timestamp_position_PID = 0;
+			currentTime = micros();
+			if(currentTime > timestamp_position_PID)
+			{
+				timestamp_position_PID = currentTime + 5000;//us
+				position_PID();
+			}
+	}
+}
+
+void set_home(){
+	static uint8_t step = 0;
+	if(registerFrame[0x01].U16==0b0010){
+		registerFrame[0x01].U16=0b0000;
+		registerFrame[0x10].U16=0b0010;
+		home = 1;
+		step = 0;
+		if(sensor_down == 1){
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*1.5/10.0);
 		}
-		else if (sensor2 == 1){
-			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
-			z_target_position = 80;
-			z_current_position = 80;
+
+	}
+	if(home == 1){
+		registerFrame[0x00].U16=22881;
+		sensor_up = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_9);
+		sensor_down = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8);
+
+		if(step == 0){
+			if(sensor_up == 0){
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+				__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*3/10.0);
+			}
+			else if(sensor_up == 1){
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
+				__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+				step = 1;
+			}
 		}
+		if(step == 1){
+			if(sensor_down == 0){
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 1);
+				__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 999*1.5/10.0);
+			}
+			else if(sensor_down == 1){
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, 0);
+				__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+				__HAL_TIM_SET_COUNTER(&htim4, 0);
+				QEIdata.Position[NEW] = 0;
+				QEIEncoderPosVel_Update();
+				angular_position = 0.0;
+				position = 0.0;
+				position_round = 0;
+				registerFrame[0x10].U16=0b0000;
+				home = 0;
+			}
+		}
+	}
+}
+
+void run_jogmode(){
+	static int floor_counter = 0;
+	if(registerFrame[0x01].U16==0b0100){
+		jog_mode = 1;
+		pick_order = registerFrame[0x21].U16;
+		place_order = registerFrame[0x22].U16;
+		floor_counter = 0;
+	}
+	if(jog_mode == 1){
+		if(floor_counter%2 == 0){
+			registerFrame[0x10].U16=0b0100;//Go Pick
+			gotofloor = pick_order%(int)pow(10,(floor_counter/2));
+		}
+		else{
+			registerFrame[0x10].U16=0b1000;//Go place
+			gotofloor = place_order%(int)pow(10,((floor_counter-1)/2));
+		}
+	  if (gotofloor == 1){
+		  setposition = z_floor[0];
+	  }
+	  else if (gotofloor == 2){
+		  setposition = z_floor[1];
+	  }
+	  else if (gotofloor == 3){
+		  setposition = z_floor[2];
+	  }
+	  else if (gotofloor == 4){
+		  setposition = z_floor[3];
+	  }
+	  else if (gotofloor == 5){
+		  setposition = z_floor[4];
+	  }
+
+	  trajectory();
+
+
+	  static uint64_t timestamp_velocity_PID = 0;
+	  uint64_t currentTime = micros();
+	  if(currentTime > timestamp_velocity_PID)
+	  {
+		  timestamp_velocity_PID = currentTime + 1000;//us
+		  QEIEncoderPosVel_Update();
+		  velocity = angular_velocity*14/2.0/M_PI;
+		  if(fabsf(setposition-position) < 0.15){
+			  Vfeedback = 0;
+		  }
+		  else{
+			  velocity_PID();
+			  Vfeedback = velocity_PID_output;
+		  }
+		  setMotor();
+	  }
+
+	  static uint64_t timestamp_position_PID = 0;
+	  currentTime = micros();
+	  if(currentTime > timestamp_position_PID)
+	  {
+		  timestamp_position_PID = currentTime + 5000;//us
+		  position_PID();
+	  }
+	  if(fabsf(setposition-position) < 0.15){
+		  static uint64_t timestamp_gripper = 0;
+		  uint64_t currentTime = micros();
+		  static uint8_t time_counter = 0;
+		  if(currentTime > timestamp_gripper){
+			  timestamp_gripper = micros()+2000000;
+			  if(time_counter == 0){
+				  time_counter = 1;
+			  }
+			  else{
+				  floor_counter++;
+				  time_counter = 0;
+			  }
+		  }
+	  }
+	}
+	if(floor_counter > 9){
+		registerFrame[0x10].U16=0b0000;
+		floor_counter = 0;
+	}
+}
+
+void setMotor()
+{
+
+	if(Vfeedback > 24){
+		registerFrame[0x00].U16=22881;
+		Vfeedback = 24;
+	}
+	else if(Vfeedback < -24){
+		registerFrame[0x00].U16=22881;
+		Vfeedback = -24;
+	}
+	if(Vfeedback > 0){
+		registerFrame[0x00].U16=22881;
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_RESET);
+		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)Vfeedback*999/24.0);
 	}
 	else{
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0);
+		registerFrame[0x00].U16=22881;
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_SET);
+		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)Vfeedback*(-999)/24.0);
 	}
-	z_diff_position = z_target_position - position;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -659,19 +1171,17 @@ void UARTDMAConfig()
 	//start UART in DMA mode
 	HAL_UART_Receive_DMA(&huart1, RxBuffer,9);
 }
-update_position()
+
+void update_position()
 {
-	int a = 0;
-	for(int i = 0; i<= 8; i++){
-		if (i == '\n'){
-			a = i;
-			break;
-		}
+	static int floor = -1;
+	floor = RxBuffer[6]-'0'-1;
+	x_target_position = (RxBuffer[0]-'0')*100+(RxBuffer[1]-'0')*10+(RxBuffer[2]-'0');
+	z_target_position = (RxBuffer[3]-'0')*100+(RxBuffer[4]-'0')*10+(RxBuffer[5]-'0');
+	if(floor >= 0){
+		x_floor[floor] = x_target_position;
+		z_floor[floor] = z_target_position;
 	}
-	x_target_position = (RxBuffer[(a+1)%9]-'0')*100+(RxBuffer[(a+2)%9]-'0')*10+(RxBuffer[(a+3)%9]-'0');
-	z_target_position = (RxBuffer[(a+4)%9]-'0')*100+(RxBuffer[(a+5)%9]-'0')*10+(RxBuffer[(a+6)%9]-'0');
-	x_floor[RxBuffer[(a+7)%9]-'0'-1] = x_target_position;
-	z_floor[RxBuffer[(a+7)%9]-'0'-1] = z_target_position;
 }
 
 //MicroSecondTimer Implement
@@ -718,6 +1228,7 @@ void QEIEncoderPosVel_Update()
 	//store value for next loop
 	QEIdata.Position[OLD] = QEIdata.Position[NEW];
 	QEIdata.TimeStamp[OLD]=QEIdata.TimeStamp[NEW];
+
 }
 
 void trajectory(){
@@ -727,7 +1238,7 @@ void trajectory(){
 		Timestamp = HAL_GetTick();
 	}
 	else if(trajec_state == 1 && trajec_target >= 0){
-		float t = (HAL_GetTick() - Timestamp)*0.001;
+		float t = ((HAL_GetTick() - Timestamp)*0.001)+0.001;
 		float time = (-100 + sqrt(10000 + (2000*trajec_target)))/1000;
 		if(HAL_GetTick() - Timestamp <= (time*1000)){
 			trajec_acceleration = 500.0;
@@ -746,14 +1257,14 @@ void trajectory(){
 		}
 		else{
 			trajec_acceleration = 0;
-//			trajec_velocity = 0;
+			trajec_velocity = 0;
 //			trajec_position = 0;
 			trajec_target = 0;
 			trajec_state = 0;
 		}
 	}
 	else if(trajec_state == 1 && trajec_target < 0){
-		float t = (HAL_GetTick() - Timestamp)*0.001;
+		float t = ((HAL_GetTick() - Timestamp)*0.001+0.001);
 		float time = (-100 + sqrt(10000 + (-2000*trajec_target)))/1000;
 		if(HAL_GetTick() - Timestamp <= (time*1000)){
 			trajec_acceleration = -500.0;
@@ -772,15 +1283,15 @@ void trajectory(){
 		}
 		else{
 			trajec_acceleration = 0;
-//			trajec_velocity = 0;
+			trajec_velocity = 0;
 //			trajec_position = 0;
 			trajec_target = 0;
 			trajec_state = 0;
 		}
 	}
 	else if(trajec_state == 0 && trajec_target == 0){
-		trajec_target = target_position-trajec_position;
-		p0 = trajec_position;
+		trajec_target = setposition-position;
+		p0 = position;
 	}
 }
 
@@ -821,24 +1332,18 @@ void position_PID(){
 	u_n1 = u_n;
 	y_n1 = y_n;
 }
-
-void setMotor()
-{
-	if(velocity_PID_output > 24){
-		velocity_PID_output = 24;
-	}
-	else if(velocity_PID_output < -24){
-		velocity_PID_output = -24;
-	}
-	if(velocity_PID_output > 0){
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_RESET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)velocity_PID_output*999/24.0);
-	}
-	else{
-		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6,GPIO_PIN_SET);
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, (int)velocity_PID_output*(-999)/24.0);
-	}
+void push(){
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10,GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4,GPIO_PIN_SET);
 }
+void pull(){
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10,GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4,GPIO_PIN_RESET);
+}
+void vacuum(){
+
+}
+
 /* USER CODE END 4 */
 
 /**
